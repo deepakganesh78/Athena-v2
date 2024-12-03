@@ -8,3 +8,11 @@ comtypes==1.2.0
 python-dotenv==1.0.0
 pycaw==20181226
 PyAudio==0.2.13
+PyQt6
+speech_recognition
+nltk
+difflib
+beautifulsoup4
+requests
+wikipedia-api
+googlesearch-python

@@ -32,6 +32,15 @@ class SystemController:
 	def restart_pc(self):
 		os.system("shutdown /r /t 1")
 
+	def sleep_pc(self):
+		"""Put the computer into sleep mode"""
+		try:
+			os.system('rundll32.exe powrprof.dll,SetSuspendState 0,1,0')
+			return True
+		except Exception as e:
+			print(f"Error putting computer to sleep: {e}")
+			return False
+
 	def get_screen_context(self):
 		# Capture the active window title
 		window_title = pyautogui.getActiveWindow().title
