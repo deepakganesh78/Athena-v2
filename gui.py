@@ -23,7 +23,7 @@ class FloatingMessage(QFrame):
         # Add message label with word wrap
         self.label = QLabel(text)
         self.label.setWordWrap(True)
-        self.label.setMaximumWidth(160)  # Adjusted width to fit window
+        self.label.setMaximumWidth(300)  # Increased from 220 to allow even longer messages
         self.label.setStyleSheet("""
             QLabel {
                 color: white;
@@ -218,7 +218,7 @@ class VoiceAssistantGUI(QMainWindow):
         
         # Create main layout with space for message
         layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(20, 40, 20, 40)  # Adjusted margins
+        layout.setContentsMargins(20, 40, 20, 60)  # Increased bottom margin for orb
         layout.setSpacing(10)  # Add spacing between widgets
         
         # Create message area (invisible placeholder)
@@ -250,13 +250,13 @@ class VoiceAssistantGUI(QMainWindow):
         
         # Add buttons to layout
         button_layout = QVBoxLayout()
-        button_layout.setSpacing(20)  # Add spacing between close button and orb
+        button_layout.setSpacing(30)  # Increased spacing between close button and orb
         button_layout.addWidget(close_button, alignment=Qt.AlignmentFlag.AlignRight)
         button_layout.addWidget(self.mic_button, alignment=Qt.AlignmentFlag.AlignCenter)
         layout.addLayout(button_layout)
         
         # Set window size and position
-        self.setFixedSize(180, 260)  # Increased both width and height
+        self.setFixedSize(340, 300)  # Increased width to accommodate wider chat box
         self.move_to_bottom_right()
         
         # Add system tray icon
