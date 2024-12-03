@@ -9,6 +9,8 @@ class AudioManager(QObject):
 	on_start_speaking = pyqtSignal(str)
 	on_word_spoken = pyqtSignal(str)
 	on_end_speaking = pyqtSignal()
+	on_speaking_started = pyqtSignal()
+	on_speaking_finished = pyqtSignal()
 
 	def __init__(self):
 		super().__init__()
@@ -16,9 +18,12 @@ class AudioManager(QObject):
 		self.setup_voice()
 		self.volume_interface = self.get_volume_interface()
 		self.current_word = ""
+		self.is_speaking = False
 		
 		# Connect speech engine callbacks
 		self.engine.connect('started-word', self.on_word_start)
+		self.engine.connect('started-utterance', self._on_speaking_started)
+		self.engine.connect('finished-utterance', self._on_speaking_finished)
 		self.engine.connect('finished-utterance', self.on_utterance_finished)
 
 	def setup_voice(self):
@@ -79,18 +84,17 @@ class AudioManager(QObject):
 			return
 			
 		# Clean and format the text
-		text = self.add_speech_markers(text)
+		formatted_text = self.add_speech_markers(text)
+		self.on_start_speaking.emit(formatted_text)
 		
-		# Emit the start signal
-		self.on_start_speaking.emit(text)
-		
-		try:
-			self.engine.say(text)
-			self.engine.runAndWait()
-		except Exception as e:
-			print(f"Error in speech synthesis: {e}")
-		finally:
-			self.on_end_speaking.emit()
+		# Split text into words for progressive display
+		words = formatted_text.split()
+		for word in words:
+			self.on_word_spoken.emit(word)
+			
+		self.engine.say(formatted_text)
+		self.engine.runAndWait()
+		self.on_end_speaking.emit()
 
 	def on_word_start(self, name, location, length):
 		self.current_word = name
@@ -98,6 +102,14 @@ class AudioManager(QObject):
 
 	def on_utterance_finished(self, name, completed):
 		self.on_end_speaking.emit()
+
+	def _on_speaking_started(self):
+		self.is_speaking = True
+		self.on_speaking_started.emit()
+		
+	def _on_speaking_finished(self):
+		self.is_speaking = False
+		self.on_speaking_finished.emit()
 
 	def get_volume_interface(self):
 		devices = AudioUtilities.GetSpeakers()

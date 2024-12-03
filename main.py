@@ -1,20 +1,32 @@
-from voice_recognition import VoiceRecognizer
+from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QGuiApplication
+from PyQt6.QtCore import Qt
 from audio_manager import AudioManager
 from system_controller import SystemController
 from web_search import WebSearch
+from time_manager import TimeManager
+from gui import VoiceAssistantGUI
 import time
 import random
-from PyQt6.QtCore import QObject, pyqtSignal
-from gui import launch_gui
+import sys
 import threading
+import nltk
+from nltk.stem import WordNetLemmatizer
 import re
 from difflib import SequenceMatcher
 from datetime import datetime
-import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import wordnet
-from nltk.stem import WordNetLemmatizer
-import sys
+from voice_recognition import VoiceRecognizer
+import speech_recognition as sr
+
+# Attempt to handle DPI awareness
+try:
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception as e:
+    print(f"DPI awareness setting failed: {e}")
 
 class VoiceAssistant(QObject):
     on_speech_detected = pyqtSignal(str)
@@ -33,16 +45,24 @@ class VoiceAssistant(QObject):
         self.is_running = False
         self.listen_thread = None
         self.lemmatizer = WordNetLemmatizer()
+        self.time_manager = None  # Will be set by GUI
+        self.gui = None  # Will be set by set_gui method
+        self.recognizer = sr.Recognizer()
+        self.listening = False
+        
+        # Connect signals
+        self.audio_manager.on_word_spoken.connect(self.on_word_spoken)
+        self.audio_manager.on_speaking_started.connect(self.on_speaking_started)
+        self.audio_manager.on_speaking_finished.connect(self.on_speaking_finished)
         
         # Download required NLTK data
         try:
             nltk.data.find('tokenizers/punkt')
-            nltk.data.find('corpora/wordnet')
         except LookupError:
-            nltk.download('punkt')
-            nltk.download('wordnet')
+            nltk.download('punkt', quiet=True)
+            nltk.download('wordnet', quiet=True)
             nltk.download('averaged_perceptron_tagger')
-        
+
         # Initialize command patterns
         self.command_patterns = {
             'volume': {
@@ -89,15 +109,17 @@ class VoiceAssistant(QObject):
             },
             'open_app': {
                 'patterns': [
-                    r'(?:open|launch|start|run).*(?:application|app|program)',
-                    r'(?:open|launch|start|run)\\s+([\\w\\s]+)',
-                    r'(?:can you|could you|please).*(?:open|launch|start|run)\\s+([\\w\\s]+)',
+                    r'(?:open|launch|start|run)\s+(.+)',
+                    r'(?:can you )?(?:open|launch|start|run)\s+(.+)',
                 ],
-                'keywords': ['open', 'launch', 'start', 'run', 'application', 'program'],
-                'synonyms': {
-                    'open': ['launch', 'start', 'run', 'execute', 'begin', 'initiate'],
-                    'application': ['app', 'program', 'software']
-                }
+                'handler': self.handle_open_app
+            },
+            'close_app': {
+                'patterns': [
+                    r'(?:close|quit|exit|terminate|end)\s+(.+)',
+                    r'(?:can you )?(?:close|quit|exit|terminate|end)\s+(.+)',
+                ],
+                'handler': self.handle_close_app
             },
             'system_control': {
                 'patterns': [
@@ -164,11 +186,53 @@ class VoiceAssistant(QObject):
                     'tell': ['show', 'give', 'what is']
                 }
             },
+            'timer': {
+                'patterns': [
+                    r'(?:set|start|create)\s+(?:a\s+)?timer\s+(?:for\s+)?(.+)',
+                    r'(?:give|set)\s+me\s+(?:a\s+)?timer\s+(?:for\s+)?(.+)',
+                ],
+                'handler': self.handle_timer_command
+            },
+            'alarm': {
+                'patterns': [
+                    r'(?:set|create)\s+(?:an\s+)?alarm\s+(?:for\s+)?(.+)',
+                    r'wake\s+me\s+(?:up\s+)?(?:at\s+)?(.+)',
+                ],
+                'handler': self.handle_alarm_command
+            },
+            'cancel_timer': {
+                'patterns': [
+                    r'(?:cancel|stop|remove)\s+(?:the\s+)?timer',
+                    r'(?:cancel|stop|remove)\s+(?:all\s+)?timers',
+                ],
+                'handler': self.handle_cancel_timer
+            },
+            'cancel_alarm': {
+                'patterns': [
+                    r'(?:cancel|stop|remove)\s+(?:the\s+)?alarm',
+                    r'(?:cancel|stop|remove)\s+(?:all\s+)?alarms',
+                ],
+                'handler': self.handle_cancel_alarm
+            },
+            'list_timers': {
+                'patterns': [
+                    r'(?:list|show|what are)\s+(?:the\s+)?(?:active\s+)?timers',
+                    r'(?:how many|what)\s+timers\s+(?:do I have|are running)',
+                ],
+                'handler': self.handle_list_timers
+            },
+            'list_alarms': {
+                'patterns': [
+                    r'(?:list|show|what are)\s+(?:the\s+)?(?:active\s+)?alarms',
+                    r'(?:how many|what)\s+alarms\s+(?:do I have|are set)',
+                ],
+                'handler': self.handle_list_alarms
+            },
         }
         
         # Initialize previous command type for context
         self.previous_command_type = None
-
+        
     def get_command_similarity(self, text, pattern):
         return SequenceMatcher(None, text.lower(), pattern.lower()).ratio()
 
@@ -181,7 +245,7 @@ class VoiceAssistant(QObject):
 
     def extract_number(self, text):
         # Extract numeric values from text
-        numbers = re.findall(r'\\b(\d+)\\b', text)
+        numbers = re.findall(r'\b(\d+)\b', text)
         if numbers:
             return int(numbers[0])
         
@@ -236,7 +300,7 @@ class VoiceAssistant(QObject):
                     score += 0.3 * (synonym_matches / len(keyword_synonyms))
             
             # Check command-specific synonyms
-            for syn_key, syn_values in cmd_info['synonyms'].items():
+            for syn_key, syn_values in cmd_info.get('synonyms', {}).items():
                 syn_matches = sum(1 for syn in syn_values if syn in lemmatized_text)
                 if syn_matches > 0:
                     score += 0.3 * (syn_matches / len(syn_values))
@@ -281,6 +345,14 @@ class VoiceAssistant(QObject):
         self.on_command_processing.emit()
         self.on_speech_detected.emit(command)
 
+        # First check for app opening commands as they're most direct
+        for cmd_type in ['open_app', 'close_app']:
+            for pattern in self.command_patterns[cmd_type]['patterns']:
+                matches = re.findall(pattern, command.lower())
+                if matches:
+                    return self.command_patterns[cmd_type]['handler'](command, matches)
+        
+        # Then check other command types
         # Identify command type and confidence
         cmd_type, confidence = self.identify_command_type(command)
         
@@ -298,7 +370,7 @@ class VoiceAssistant(QObject):
                 if any(word in command.lower() for word in ['up', 'higher', 'increase', 'louder', 'raise']):
                     self.audio_manager.volume_up()
                     self.respond("Increasing volume")
-                elif any(word in command.lower() for word in ['down', 'lower', 'decrease', 'quieter', 'softer', 'reduce']):
+                elif any(word in command.lower() for word in ['down', 'lower', 'decrease', 'quieter', 'softer']):
                     self.audio_manager.volume_down()
                     self.respond("Decreasing volume")
                 elif any(word in command.lower() for word in ['mute', 'silence']):
@@ -319,18 +391,6 @@ class VoiceAssistant(QObject):
                 "Good to see you! What's on your mind?"
             ]
             self.respond(random.choice(responses))
-        elif cmd_type == 'open_app':
-            app_name = re.sub(r'(?:open|launch|start|run|please|could you|can you)\\s+', '', command).strip()
-            if self.system_controller.open_application(app_name):
-                responses = [
-                    f"Opening {app_name} for you",
-                    f"I'll get {app_name} started",
-                    f"Sure, launching {app_name} now",
-                    f"Right away! Starting {app_name}"
-                ]
-                self.respond(random.choice(responses))
-            else:
-                self.respond(f"I couldn't find {app_name}. Could you specify the application name?")
         elif cmd_type == 'search':
             search_query = re.sub(r'(?:search|look up|find|google|for|please|could you|can you|what is|who is|tell me about)\\s+', '', command).strip()
             
@@ -370,12 +430,144 @@ class VoiceAssistant(QObject):
             else:
                 current_date = self.get_current_date()
                 self.respond(f"The current date is {current_date}")
+        elif cmd_type == 'timer':
+            # Check for numeric volume setting
+            duration_match = re.search(r'(\d+)(?:\s*(?:minutes|minute|mins|min|m|seconds|second|secs|sec|s|h|hours|hour))?', command)
+            if duration_match:
+                duration = duration_match.group(1)
+                unit = duration_match.group(2)
+                if unit in ['minutes', 'minute', 'mins', 'min', 'm']:
+                    duration_in_seconds = int(duration) * 60
+                elif unit in ['seconds', 'second', 'secs', 'sec', 's']:
+                    duration_in_seconds = int(duration)
+                elif unit in ['hours', 'hour', 'h']:
+                    duration_in_seconds = int(duration) * 3600
+                else:
+                    duration_in_seconds = int(duration) * 60  # Default to minutes
+                response = self.time_manager.set_timer(duration_in_seconds)
+                self.audio_manager.speak(response)
+                return
+        elif cmd_type == 'alarm':
+            time_str = re.sub(r'(?:set|create|wake|me|up|at|alarm|for)\\s+', '', command).strip()
+            response = self.time_manager.set_alarm(time_str)
+            self.audio_manager.speak(response)
+            return
+        elif cmd_type == 'cancel_timer':
+            response = self.time_manager.list_timers()
+            if response == "No active timers":
+                self.audio_manager.speak(response)
+            else:
+                # Cancel all timers for now - could be made more specific later
+                for timer_name in list(self.time_manager.timers.keys()):
+                    self.time_manager.cancel_timer(timer_name)
+                self.audio_manager.speak("All timers cancelled")
+            return
+        elif cmd_type == 'cancel_alarm':
+            response = self.time_manager.list_alarms()
+            if response == "No active alarms":
+                self.audio_manager.speak(response)
+            else:
+                # Cancel all alarms for now - could be made more specific later
+                for alarm_name in list(self.time_manager.alarms.keys()):
+                    self.time_manager.cancel_alarm(alarm_name)
+                self.audio_manager.speak("All alarms cancelled")
+            return
+        elif cmd_type == 'list_timers':
+            response = self.time_manager.list_timers()
+            self.audio_manager.speak(response)
+            return
+        elif cmd_type == 'list_alarms':
+            response = self.time_manager.list_alarms()
+            self.audio_manager.speak(response)
+            return
         else:
             # For any unrecognized command, try to find relevant information
             self.respond("Let me search for that information")
             result = self.web_search.get_information(command)
             self.respond(result)
 
+    def handle_open_app(self, command, matches):
+        """Handle requests to open applications"""
+        app_name = matches[0].strip().lower()
+        
+        # Remove common phrases
+        app_name = re.sub(r'(?:please|for me|the app|application)\s*', '', app_name)
+        
+        # Try to open the application
+        response = self.system_controller.open_application(app_name)
+        self.audio_manager.speak(response)
+        return True
+
+    def handle_close_app(self, command, matches):
+        """Handle requests to close applications"""
+        app_name = matches[0].strip().lower()
+        
+        # Remove common phrases
+        app_name = re.sub(r'(?:please|for me|the app|application)\s*', '', app_name)
+        
+        # Try to close the application
+        response = self.system_controller.close_application(app_name)
+        self.audio_manager.speak(response)
+        return True
+
+    def handle_timer_command(self, command, matches):
+        """Handle timer-related commands"""
+        duration = matches[0].strip()
+        response = self.time_manager.set_timer(duration)
+        self.audio_manager.speak(response)
+        return True
+    
+    def handle_alarm_command(self, command, matches):
+        """Handle alarm-related commands"""
+        time_str = matches[0].strip()
+        response = self.time_manager.set_alarm(time_str)
+        self.audio_manager.speak(response)
+        return True
+    
+    def handle_cancel_timer(self, command, matches):
+        """Handle timer cancellation"""
+        response = self.time_manager.list_timers()
+        if response == "No active timers":
+            self.audio_manager.speak(response)
+        else:
+            # Cancel all timers for now - could be made more specific later
+            for timer_name in list(self.time_manager.timers.keys()):
+                self.time_manager.cancel_timer(timer_name)
+            self.audio_manager.speak("All timers cancelled")
+        return True
+    
+    def handle_cancel_alarm(self, command, matches):
+        """Handle alarm cancellation"""
+        response = self.time_manager.list_alarms()
+        if response == "No active alarms":
+            self.audio_manager.speak(response)
+        else:
+            # Cancel all alarms for now - could be made more specific later
+            for alarm_name in list(self.time_manager.alarms.keys()):
+                self.time_manager.cancel_alarm(alarm_name)
+            self.audio_manager.speak("All alarms cancelled")
+        return True
+    
+    def handle_list_timers(self, command, matches):
+        """Handle timer listing"""
+        response = self.time_manager.list_timers()
+        self.audio_manager.speak(response)
+        return True
+    
+    def handle_list_alarms(self, command, matches):
+        """Handle alarm listing"""
+        response = self.time_manager.list_alarms()
+        self.audio_manager.speak(response)
+        return True
+    
+    def _on_timer_complete(self, timer_name):
+        """Handle timer completion"""
+        self.audio_manager.speak(f"{timer_name} is complete!")
+    
+    def _on_alarm_triggered(self, alarm_name):
+        """Handle alarm triggering"""
+        self.audio_manager.speak(f"Wake up! {alarm_name} is ringing!")
+    
     def handle_volume_command(self, command):
         command = command.lower()
         
@@ -404,7 +596,7 @@ class VoiceAssistant(QObject):
             return
         
         # Check for volume decrease
-        if any(word in command for word in ['down', 'lower', 'decrease', 'quieter', 'softer']):
+        if any(word in command.lower() for word in ['down', 'lower', 'decrease', 'quieter', 'softer']):
             self.audio_manager.change_volume(-10)
             responses = [
                 "I've lowered the volume for you",
@@ -431,17 +623,20 @@ class VoiceAssistant(QObject):
         pass  # We can use this if needed
 
     def start_listening(self):
-        self.is_running = True
-        self.listen_thread = threading.Thread(target=self.run_listening)
-        self.listen_thread.start()
-
+        """Start listening for voice input"""
+        if not self.listen_thread or not self.listen_thread.is_alive():
+            self.listening = True
+            self.gui.on_assistant_listening()
+            self.listen_thread = threading.Thread(target=self._listen_loop)
+            self.listen_thread.daemon = True
+            self.listen_thread.start()
+            
     def stop_listening(self):
-        """Stop the listening process"""
-        self.is_running = False
-        # Don't wait for the thread to join here
-        # Instead, start a new thread to handle the cleanup
-        cleanup_thread = threading.Thread(target=self._cleanup_listen_thread)
-        cleanup_thread.start()
+        """Stop listening for voice input"""
+        self.listening = False
+        if self.listen_thread and self.listen_thread.is_alive():
+            self.listen_thread.join(timeout=1.0)
+        self.gui.on_assistant_idle()
 
     def _cleanup_listen_thread(self):
         """Helper method to cleanup the listening thread"""
@@ -450,31 +645,75 @@ class VoiceAssistant(QObject):
             if self.listen_thread.is_alive():
                 print("Warning: Listen thread is taking longer than expected to stop")
 
-    def run_listening(self):
-        while self.is_running:
-            try:
-                detected_speech = self.voice_recognizer.listen_for_command()
-                if detected_speech:
-                    print(f"\nDetected speech: '{detected_speech}'")
-                    self.process_command(detected_speech)
-                else:
-                    # If speech detection fails, try reinitializing the microphone
-                    if not self.voice_recognizer.microphone:
-                        print("Attempting to reinitialize microphone...")
-                        if self.voice_recognizer.reinitialize_microphone():
-                            self.respond("Microphone reinitialized successfully")
-                        else:
-                            self.respond("Sorry, I'm having trouble with the microphone. Please check your microphone settings.")
-                            time.sleep(5)  # Wait before trying again
-            except Exception as e:
-                print(f"Error in listening loop: {e}")
-                self.respond("Sorry, I encountered an error while listening. I'll try to recover.")
-                time.sleep(2)  # Brief pause before continuing
-
+    def _listen_loop(self):
+        """Main listening loop"""
+        with sr.Microphone() as source:
+            print("Adjusting for ambient noise...")
+            self.recognizer.adjust_for_ambient_noise(source, duration=1)
+            print("Microphone initialized successfully")
+            
+            while self.listening:
+                try:
+                    audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=10)
+                    try:
+                        text = self.recognizer.recognize_google(audio)
+                        if text:
+                            self.gui.on_assistant_processing()
+                            print(f"Recognized: {text}")
+                            self.process_command(text)
+                    except sr.UnknownValueError:
+                        pass  # Speech was not understood
+                    except sr.RequestError as e:
+                        print(f"Could not request results; {e}")
+                except sr.WaitTimeoutError:
+                    pass  # No speech detected within timeout
+                except Exception as e:
+                    print(f"Error in listening loop: {e}")
+                    
     def handle_partial_result(self, text):
         self.on_interim_speech.emit(f"Listening: {text}")
 
-if __name__ == "__main__":
+    def on_word_spoken(self, word):
+        self.on_assistant_word.emit(word)
+
+    def on_speaking_started(self):
+        """Called when the assistant starts speaking"""
+        self.gui.on_assistant_speaking()
+        
+    def on_speaking_finished(self):
+        """Called when the assistant finishes speaking"""
+        self.gui.on_assistant_idle()
+
+    def set_gui(self, gui):
+        """Set the GUI reference"""
+        self.gui = gui
+
+def main():
+    # Create QApplication first
+    app = QApplication(sys.argv)
+    
+    # Enable High DPI scaling for PyQt6
+    app.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+    
+    # Create the assistant and GUI
     assistant = VoiceAssistant()
-    app, gui = launch_gui(assistant)
+    gui = VoiceAssistantGUI(assistant)
+    
+    # Set up bidirectional reference
+    assistant.set_gui(gui)
+    
+    # Create TimeManager in the main thread
+    time_manager = TimeManager()
+    assistant.time_manager = time_manager
+    
+    # Connect time manager signals
+    time_manager.timer_complete.connect(assistant._on_timer_complete)
+    time_manager.alarm_triggered.connect(assistant._on_alarm_triggered)
+    
+    gui.show()
     sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()

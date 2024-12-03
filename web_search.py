@@ -8,7 +8,7 @@ class WebSearch:
     def __init__(self):
         self.search_cache = {}
         self.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        
+
     def clean_text(self, text):
         """Clean and format the search result text"""
         # Remove extra whitespace
@@ -56,76 +56,124 @@ class WebSearch:
         
         return '. '.join(cleaned_sentences)
 
-    def search_web(self, query, num_results=8):
-        """Search the web using Google"""
+    def enhance_query(self, query):
+        """Enhance query based on type of question"""
+        query_lower = query.lower()
+        current_year = str(time.gmtime().tm_year)
+        
+        # Product queries
+        if any(word in query_lower for word in ['latest', 'newest', 'recent']):
+            if 'phone' in query_lower:
+                brand = ''
+                for brand_name in ['samsung', 'iphone', 'pixel', 'oneplus', 'xiaomi']:
+                    if brand_name in query_lower:
+                        brand = brand_name
+                        break
+                return f"{brand} phone {current_year} release date specifications"
+            
+        # Movie cast queries
+        if 'cast' in query_lower or ('who' in query_lower and 'play' in query_lower):
+            return query + " movie cast main actors"
+            
+        # Age queries
+        if 'how old' in query_lower or 'age of' in query_lower:
+            return query + " age birth date wikipedia"
+            
+        # Historical/Political queries
+        if any(word in query_lower for word in ['president', 'prime minister', 'leader']):
+            if 'current' in query_lower or 'now' in query_lower:
+                return query + f" {current_year} current"
+            return query + " history wikipedia"
+            
+        return query
+
+    def search_web(self, query, num_results=5):
+        """Enhanced web search with better result extraction"""
         try:
-            # Check cache first
+            # Check cache
             if query in self.search_cache:
                 return self.search_cache[query]
+
+            # Enhance query
+            enhanced_query = self.enhance_query(query)
             
-            # Add specificity to certain queries
-            if 'latest' in query.lower() and 'movie' in query.lower():
-                query += ' ' + time.strftime('%Y')  # Add current year
-            elif 'photosynthesis' in query.lower():
-                query += ' process definition explanation'
-            
-            results = []
+            # Perform search
+            search_results = []
             headers = {'User-Agent': self.user_agent}
             
-            for url in search(query, num_results=num_results):
+            # Get URLs from Google
+            urls = list(search(enhanced_query, num_results=num_results, stop=num_results))
+            
+            # Process each URL
+            for url in urls:
                 try:
                     response = requests.get(url, headers=headers, timeout=5)
                     if response.status_code == 200:
                         soup = BeautifulSoup(response.text, 'html.parser')
                         
                         # Remove unwanted elements
-                        for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
-                            element.decompose()
+                        for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
+                            tag.decompose()
                         
-                        # Get main content
-                        main_content = soup.find('main') or soup.find('article') or soup.find('div', class_=re.compile(r'content|main|article'))
-                        if main_content:
-                            soup = main_content
+                        # Extract main content
+                        main_content = ""
                         
-                        # Get paragraphs with meaningful content
-                        paragraphs = soup.find_all(['p', 'h1', 'h2', 'h3'])
-                        content = []
+                        # First try to find specific content based on query type
+                        query_lower = query.lower()
+                        if 'phone' in query_lower:
+                            # Look for spec tables or lists
+                            specs = soup.find_all(['table', 'ul'], class_=re.compile(r'spec|feature|detail', re.I))
+                            for spec in specs:
+                                main_content += spec.get_text() + " "
                         
-                        for p in paragraphs:
-                            text = p.get_text().strip()
-                            if len(text) > 100:  # Only consider substantial paragraphs
-                                cleaned_text = self.clean_text(text)
-                                if cleaned_text and len(cleaned_text) > 50:
-                                    content.append(cleaned_text)
+                        # If no specific content found, get general content
+                        if not main_content:
+                            for tag in ['article', 'main', 'div']:
+                                content_tags = soup.find_all(tag, class_=re.compile(r'content|article|main|text', re.I))
+                                for content in content_tags:
+                                    text = content.get_text()
+                                    if len(text) > 200:
+                                        main_content += text + " "
                         
-                        if content:
-                            # Get the most relevant content
-                            relevant_content = max(content, key=len)
-                            if len(relevant_content) > 50:
-                                results.append(relevant_content)
-                                if len(results) >= 2:  # If we have enough good results
-                                    break
-                            
+                        if not main_content:  # Fallback to paragraphs
+                            paragraphs = soup.find_all('p')
+                            main_content = " ".join(p.get_text() for p in paragraphs)
+                        
+                        search_results.append(self.clean_text(main_content))
+                        
                 except Exception as e:
-                    print(f"Error processing URL {url}: {e}")
                     continue
             
-            if results:
-                # Combine and format the best results
-                final_result = ' '.join(results[:2])
-                if len(final_result) > 250:  # Keep response concise
-                    final_result = final_result[:247] + "..."
+            # Process results
+            if search_results:
+                combined_result = " ".join(search_results)
+                sentences = re.split(r'[.!?]+', combined_result)
+                relevant_sentences = []
                 
-                # Final cleanup
-                final_result = self.clean_text(final_result)
-                self.search_cache[query] = final_result
-                return final_result
+                # Extract most relevant sentences
+                query_words = set(query.lower().split())
+                for sentence in sentences:
+                    sentence = sentence.strip()
+                    if len(sentence) > 20:
+                        sentence_words = set(sentence.lower().split())
+                        relevance_score = len(query_words & sentence_words)
+                        if relevance_score >= 2:
+                            relevant_sentences.append((sentence, relevance_score))
+                
+                # Sort by relevance
+                relevant_sentences.sort(key=lambda x: x[1], reverse=True)
+                
+                # Take top 3 most relevant sentences
+                if relevant_sentences:
+                    response = ". ".join(s[0] for s in relevant_sentences[:3]) + "."
+                    self.search_cache[query] = response
+                    return response
             
-            return "I couldn't find specific information about that. Could you try rephrasing your question?"
+            return "I couldn't find specific information about that. Please try asking in a different way."
             
         except Exception as e:
-            print(f"Error searching web: {e}")
-            return "I'm having trouble searching for that information right now. Please try again in a moment."
+            print(f"Search error: {e}")
+            return "I'm having trouble searching for that information right now."
 
     def get_simple_definition(self, query):
         """Get a simple, direct definition or explanation"""
